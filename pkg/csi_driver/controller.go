@@ -204,6 +204,14 @@ func (m *controllerServer) Run(stopCh <-chan struct{}) {
 
 // CreateVolume creates a GCFS instance
 func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	sharePoolPath := req.GetParameters()[paramSharePool]
+	if sharePoolPath != "" {
+		if s.config.features.FeatureSharePools == nil || !s.config.features.FeatureSharePools.Enabled {
+			return nil, status.Error(codes.InvalidArgument, "Filestore Share Pools feature is disabled on this driver")
+		}
+		return s.handleCreateSharePoolVolume(ctx, req, sharePoolPath)
+	}
+
 	if strings.ToLower(req.GetParameters()[paramMultishare]) == "true" {
 		if s.config.multiShareController == nil {
 			return nil, status.Error(codes.InvalidArgument, "multishare controller not enabled")
@@ -375,10 +383,10 @@ func (s *controllerServer) reserveIPRange(ctx context.Context, filer *file.Servi
 		return "", err
 	}
 	ipRangeSize := util.IpRangeSize
-	if filer.Tier == enterpriseTier || filer.Tier == zonalTier || filer.Tier == regionalTier {
+	if filer.Tier == enterpriseTier {
 		ipRangeSize = util.IpRangeSizeEnterprise
 	}
-	if filer.Tier == highScaleTier {
+	if filer.Tier == highScaleTier || filer.Tier == zonalTier || filer.Tier == regionalTier {
 		ipRangeSize = util.IpRangeSizeHighScale
 	}
 	unreservedIPBlock, err := s.config.ipAllocator.GetUnreservedIPRange(cidr, ipRangeSize, cloudInstancesReservedIPRanges)
@@ -425,6 +433,13 @@ func (s *controllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume id is empty")
+	}
+
+	if isSharePoolVolumeID(volumeID) {
+		if s.config.features.FeatureSharePools == nil || !s.config.features.FeatureSharePools.Enabled {
+			return nil, status.Errorf(codes.FailedPrecondition, "cannot delete share pool volume %q: Share Pools feature is disabled", volumeID)
+		}
+		return s.handleDeleteSharePoolVolume(ctx, req, volumeID)
 	}
 
 	if isMultishareVolId(volumeID) {
@@ -775,7 +790,7 @@ func (s *controllerServer) generateNewFileInstance(name string, capBytes int64, 
 				fileProtocol = v
 			}
 		case ParameterKeyLabels, ParameterKeyPVCName, ParameterKeyPVCNamespace, ParameterKeyPVName, paramMountOptions:
-		case "csiprovisionersecretname", "csiprovisionersecretnamespace":
+		case "csiprovisionersecretname", "csiprovisionersecretnamespace", paramSharePool:
 		default:
 			return nil, fmt.Errorf("invalid parameter %q", k)
 		}

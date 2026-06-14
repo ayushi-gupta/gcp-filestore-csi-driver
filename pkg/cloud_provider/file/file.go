@@ -17,6 +17,7 @@ limitations under the License.
 package file
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -75,6 +76,11 @@ type Share struct {
 	CapacityBytes    int64
 	BackupId         string
 	NfsExportOptions []*NfsExportOptions
+}
+
+type PoolShare struct {
+	IpAddress string
+	ShareName string
 }
 
 type MultishareInstance struct {
@@ -193,9 +199,13 @@ type Service interface {
 	GetOp(ctx context.Context, op string) (*filev1beta1multishare.Operation, error)
 	IsOpDone(op *filev1beta1multishare.Operation) (bool, error)
 	ListOps(ctx context.Context, resource *ListFilter) ([]*filev1beta1multishare.Operation, error)
+	// Share pool ops
+	AcquireShare(ctx context.Context, parentPool string, requestID string, capacityGb int64) (*PoolShare, error)
+	ReleaseShare(ctx context.Context, poolName string, ipAddress string, shareID string) error
 }
 
 type gcfsServiceManager struct {
+	httpClient        *http.Client
 	fileService       *filev1beta1.Service
 	instancesService  *filev1beta1.ProjectsLocationsInstancesService
 	operationsService *filev1beta1.ProjectsLocationsOperationsService
@@ -269,6 +279,7 @@ func NewGCFSService(version string, client *http.Client, primaryFilestoreService
 	klog.Infof("Using endpoint %q for multishare filestore", fileMultishareService.BasePath)
 
 	return &gcfsServiceManager{
+		httpClient:                       client,
 		fileService:                      fileService,
 		instancesService:                 filev1beta1.NewProjectsLocationsInstancesService(fileService),
 		operationsService:                filev1beta1.NewProjectsLocationsOperationsService(fileService),
@@ -1468,4 +1479,97 @@ func extractNfsShareExportOptions(options []*NfsExportOptions) []*filev1beta1mul
 			})
 	}
 	return filerOpts
+}
+
+type AcquireShareRequest struct {
+	CapacityGb int64  `json:"capacityGb,string,omitempty"`
+	RequestId  string `json:"requestId,omitempty"`
+}
+
+type AcquireShareResponse struct {
+	IpAddress string `json:"ipAddress,omitempty"`
+	ShareId   string `json:"shareId,omitempty"`
+}
+
+type ReleaseShareRequest struct {
+	IpAddress string `json:"ipAddress,omitempty"`
+	ShareId   string `json:"shareId,omitempty"`
+}
+
+func (manager *gcfsServiceManager) AcquireShare(ctx context.Context, parentPool string, requestID string, capacityGb int64) (*PoolShare, error) {
+	reqBody := &AcquireShareRequest{
+		CapacityGb: capacityGb,
+		RequestId:  requestID,
+	}
+
+	basePath := manager.fileService.BasePath
+	if !strings.HasSuffix(basePath, "/") {
+		basePath += "/"
+	}
+	url := fmt.Sprintf("%sv1beta1/%s:acquireShare", basePath, parentPool)
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal AcquireShareRequest: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create AcquireShare http request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := manager.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send AcquireShare request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, googleapi.CheckResponse(resp)
+	}
+
+	var respBody AcquireShareResponse
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		return nil, fmt.Errorf("failed to decode AcquireShareResponse: %w", err)
+	}
+
+	return &PoolShare{
+		IpAddress: respBody.IpAddress,
+		ShareName: respBody.ShareId,
+	}, nil
+}
+
+func (manager *gcfsServiceManager) ReleaseShare(ctx context.Context, poolName string, ipAddress string, shareID string) error {
+	reqBody := &ReleaseShareRequest{
+		IpAddress: ipAddress,
+		ShareId:   shareID,
+	}
+
+	basePath := manager.fileService.BasePath
+	if !strings.HasSuffix(basePath, "/") {
+		basePath += "/"
+	}
+	url := fmt.Sprintf("%sv1beta1/%s:releaseShare", basePath, poolName)
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ReleaseShareRequest: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create ReleaseShare http request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := manager.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send ReleaseShare request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return googleapi.CheckResponse(resp)
+	}
+
+	return nil
 }
