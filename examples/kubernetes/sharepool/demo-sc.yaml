@@ -1,0 +1,7 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: filestore-share-pool-sc
+provisioner: filestore.csi.storage.gke.io
+parameters:
+  sharepool: "projects/<project>/locations/<location>/sharePools/<share-pool-name>"
